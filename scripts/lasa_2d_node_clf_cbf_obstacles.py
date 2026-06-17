@@ -246,15 +246,19 @@ def main():
     p_sq = 6   # superellipse exponent
 
     # Square obstacles
-    center1          = (-27, -7)
-    semi_major_axis1 = 5
+    # Center shifted SW by 1.25√2 to remove the upper-right half (ta > 0);
+    # semi_major halved from 5 to 2.5 so the obstacle covers only the lower-left half.
+    center1          = (-27 - 1.25 * np.sqrt(2), -7 - 1.25 * np.sqrt(2))
+    semi_major_axis1 = 2.5
     semi_minor_axis1 = 7
     angle1           = -np.pi / 4
 
-    center2          = (-25, -14)
-    semi_major_axis2 = 12
+    # Center shifted by +3√2 in both x and y to remove the bottom-left half;
+    # semi_major halved from 12 to 6 so the obstacle now covers only the upper-right half.
+    center2          = (-25 + 3 * np.sqrt(2), -14 + 3 * np.sqrt(2))
+    semi_major_axis2 = 6
     semi_minor_axis2 = 3
-    angle2           = np.pi / 4
+    angle2           = np.pi / 4 + np.pi / 2   # rotated 90° CCW from original
 
     # Full ring (annulus)
     c      = jnp.array([-4.0, -14.0])
@@ -334,7 +338,7 @@ def main():
     lambda_v  = 0.1
     eps_sq    = 1e-9
 
-    max_steps = 5000
+    max_steps = 2000
     reach_tol = 0.5
 
     print("\nRunning CLF-CBF QP loop...")
@@ -372,9 +376,12 @@ def main():
         g2y = S2 ** (1.0/p_sq - 1) * (-(ta2/a2)**(p_sq-1)*np.sin(angle2)/a2
                                         + (tb2/b2)**(p_sq-1)*np.cos(angle2)/b2)
 
-        B      = sq1 * sq2
-        grad_B = jnp.array([[g1x * sq2 + sq1 * g2x,
-                              g1y * sq2 + sq1 * g2y]])
+        # Individual gradients — separate constraints, one per obstacle.
+        # Using a product CBF (sq1*sq2) is wrong for two non-overlapping obstacles:
+        # the cross terms in the gradient cancel near the boundary and the QP can
+        # become infeasible, causing the fallback v=0 to let the robot pass through.
+        grad_sq1 = np.array([g1x, g1y])
+        grad_sq2 = np.array([g2x, g2y])
 
         # Ring CBF via JAX autodiff
         _Bv, _gv = _ring_vg(jnp.asarray(x_t, dtype=float))
@@ -394,11 +401,12 @@ def main():
             cp.Minimize(cp.quad_form(vopt, Q)
                         + lambda_v * cp.quad_form(epsilon, np.eye(1))),
             [G_L @ vopt - epsilon <= h_L,
-             grad_B   @ (fx_t + vopt) >= -alpha_B   * B,
+             grad_sq1 @ (fx_t + vopt) >= -alpha_B   * sq1,
+             grad_sq2 @ (fx_t + vopt) >= -alpha_B   * sq2,
              grad_B_c @ (fx_t + vopt) >= -alpha_B_c * B_c,
              grad_B_e @ (fx_t + vopt) >= -alpha_B_e * B_e],
         )
-        prob.solve(verbose=False)
+        prob.solve(solver=cp.OSQP, verbose=False, polish=False)
 
         v_val = vopt.value if vopt.value is not None else np.zeros(x_t.shape[0])
 
