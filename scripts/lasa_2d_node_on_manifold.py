@@ -110,10 +110,15 @@ def square_xy(xc, yc, a, b, angle, p=6, n=300):
     return xs, ys
 
 
-def ring_sector_xy(xc, yc, ri, ro, n=180):
-    th = np.linspace(0, 2 * np.pi, n)
-    xo = xc + ro * np.cos(th);  yo = yc + ro * np.sin(th)
-    xi = xc + ri * np.cos(th[::-1]); yi = yc + ri * np.sin(th[::-1])
+def ring_sector_xy(xc, yc, ri, ro, n=180,
+                   open_start=-np.pi/4, open_end=np.pi/4):
+    """Draw a 3/4 ring (C-shape). Opening spans [open_start, open_end] (rad).
+    Closed arc goes counterclockwise from open_end to open_start + 2π."""
+    th = np.linspace(open_end, open_start + 2 * np.pi, n)
+    xo = xc + ro * np.cos(th)
+    yo = yc + ro * np.sin(th)
+    xi = xc + ri * np.cos(th[::-1])
+    yi = yc + ri * np.sin(th[::-1])
     return (np.concatenate([xo, xi, xo[:1]]),
             np.concatenate([yo, yi, yo[:1]]))
 
@@ -205,9 +210,21 @@ def main():
     def _gamma_ellipse(x):
         return ((x[0] - xe) / ae) ** 2 + ((x[1] - ye) / be) ** 2
 
-    def _gamma_ring_outer(x):
+    # 3/4-ring opening: lower-left, ±45° from the -135° direction.
+    _ring_open_dir = jnp.array([-1.0 / np.sqrt(2), -1.0 / np.sqrt(2)])
+    _ring_open_cos = float(np.cos(np.pi / 4))   # ≈ 0.707, same ±45° half-width
+
+    def _gamma_ring_3quarter(x):
         diff = x - _cc
-        return jnp.sqrt(diff @ diff + _eps) / r_out
+        r = jnp.sqrt(diff @ diff + _eps)
+        gamma_outer = r / r_out
+        diff_norm = diff / (r + _eps)
+        cos_a = diff_norm @ _ring_open_dir
+        # Hard cutoff: open sector (cos_a > threshold) → Gamma=100 (no obstacle);
+        # closed sector → r/r_out as usual.
+        # jnp.where gradient is 0 in the open branch, but w_mod=0 there anyway
+        # (Gamma=100 >> 1+mod_margin), so M_eff=I and the zero gradient is harmless.
+        return jnp.where(cos_a > _ring_open_cos, jnp.array(100.0), gamma_outer)
 
     def gamma_combined(x):
         # Use min over individual Γᵢ as the combined representation.
@@ -217,7 +234,7 @@ def main():
         # straight-through of the argmin element, which is correct geometrically.
         g1 = _gamma_sq(x, _c1, semi_major_axis1, semi_minor_axis1, angle1)
         g2 = _gamma_sq(x, _c2, semi_major_axis2, semi_minor_axis2, angle2)
-        g3 = _gamma_ring_outer(x)
+        g3 = _gamma_ring_3quarter(x)
         g4 = _gamma_ellipse(x)
         return jnp.min(jnp.stack([g1, g2, g3, g4]))
 
@@ -227,7 +244,7 @@ def main():
     # Individual Gamma JIT functions for per-obstacle blend weights
     _gamma_sq1_jit  = jax.jit(lambda x: _gamma_sq(x, _c1, semi_major_axis1, semi_minor_axis1, angle1))
     _gamma_sq2_jit  = jax.jit(lambda x: _gamma_sq(x, _c2, semi_major_axis2, semi_minor_axis2, angle2))
-    _gamma_ring_jit = jax.jit(_gamma_ring_outer)
+    _gamma_ring_jit = jax.jit(_gamma_ring_3quarter)
     _gamma_ell_jit  = jax.jit(_gamma_ellipse)
 
     # ── On-manifold modulation matrix M(x) ───────────────────────────────────
@@ -240,6 +257,9 @@ def main():
     def compute_modulation_matrix(x):
         """Returns M(x) using diagonal modulation (no φ term)."""
         Gamma, grad_Gamma = _gamma_vg(x)
+        # Clamp Gamma ≥ 1 so λ₁ = 1-1/Γ stays ≥ 0.  Discrete Euler steps can
+        # overshoot the boundary (Γ drops below 1); without the clamp λ₁ < 0
+        # reverses the normal component and pushes the robot deeper inside.
         norm_g = jnp.sqrt(grad_Gamma @ grad_Gamma + 1e-12)
         n_hat  = grad_Gamma / norm_g
         e1     = jnp.array([-n_hat[1], n_hat[0]])
@@ -268,15 +288,20 @@ def main():
     alpha_L    = 4.0
     clf_margin = 0.3    # CLF suppressed when Gamma < 1+clf_margin
     k_goal     = 2.0   # goal-directed DS gain
-    k_rot      = 6.0   # CW rotation gain around ellipse center
+    k_rot      = 6.0   # CW  rotation gain around ellipse center
+    k_ring     = 4.0   # CCW rotation gain around ring center (guides robot over the top)
     max_steps  = 5000
     reach_tol  = 0.5
 
     # Per-obstacle goal-blend margins:
     # sq1/sq2 get a tight margin so the nominal NODE DS dominates most of the time.
-    sq_blend_margin   = 0.3
-    ring_blend_margin = 1.0
-    ell_blend_margin  = 1.0
+    sq_blend_margin   = 0.1
+    ring_blend_margin = 0.5   # larger margin: CCW blend activates before robot gets too close
+    ell_blend_margin  = 0.1
+
+    # Soft modulation activation margin: M(x) blends linearly to I when
+    # Γ > 1 + mod_margin, so the nominal DS is unaffected far from obstacles.
+    mod_margin = 1.5
 
     # Goal: reference trajectory endpoint; ellipse center for CW rotation
     xgoal  = xref[-1]
@@ -323,21 +348,32 @@ def main():
         w_total = w1 + w2 + w3 + w4 + 1e-9
 
         v_goal_d = k_goal * (xgoal - x_t)
-        # CW rotation field around ellipse center: v_cw = [(y-ye), -(x-xe)].
-        # Below ellipse center (y < ye): pure CW rotation gives e₁·v < 0
-        # (leftward tangential) → robot sweeps left around the bottom arc.
-        # Above ellipse center (y ≥ ye): goal-directed DS already has e₁·v < 0
-        # at the upper-left arc (goal is upper-right from there) → natural exit.
-        # Blend smoothly between the two using w_cw ∈ [0,1].
+
+        # Ring: goal-directed toward an escape point outside the opening.
+        # CCW rotation fails at the ring center (zero field); a fixed attraction
+        # point past the opening works for any robot position inside/near the ring.
+        cx_ring = float(np.asarray(c)[0])   # -4.0
+        cy_ring = float(np.asarray(c)[1])   # -14.0
+        escape_pt = jnp.array([cx_ring + (r_out + 3.0) * float(_ring_open_dir[0]),
+                                cy_ring + (r_out + 3.0) * float(_ring_open_dir[1])])
+        v_ccw_ring = k_ring * (escape_pt - x_t)
+
+        # Ellipse: CW rotation around ellipse center.
         v_cw_pure = k_rot * jnp.array([(x_t[1] - ye_val), -(x_t[0] - xe_val)])
         w_cw = max(0.0, min(1.0, (ye_val - float(x_t[1])) / float(be)))
         v_blend_ell = w_cw * v_cw_pure + (1.0 - w_cw) * v_goal_d
 
-        v_blend_target = ((w1 + w2 + w3) * v_goal_d + w4 * v_blend_ell) / w_total
+        v_blend_target = ((w1 + w2) * v_goal_d + w3 * v_ccw_ring + w4 * v_blend_ell) / w_total
         v_input  = (1.0 - w_goal) * v_clf + w_goal * v_blend_target
 
         # ── Step 3: On-manifold modulation (outer layer, diagonal M, no φ) ────
-        v_final, Gamma = _apply_mod(x_t, v_input)
+        # Soft activation: blend M(x) → I as Γ → 1 + mod_margin.
+        # When Γ > 1 + mod_margin: w_mod = 0 → M_eff = I (no effect).
+        # When Γ = 1 (boundary):   w_mod = 1 → M_eff = M(x) (full modulation).
+        M_mat, Gamma = compute_modulation_matrix(x_t)
+        w_mod = max(0.0, min(1.0, (1.0 + mod_margin - float(Gamma)) / mod_margin))
+        M_eff = w_mod * M_mat + (1.0 - w_mod) * jnp.eye(2)
+        v_final = M_eff @ v_input
 
         # ── Euler step ────────────────────────────────────────────────────────
         xnext = x_t + v_final * dti
@@ -362,7 +398,8 @@ def main():
     x2sq, y2sq = square_xy(center2[0], center2[1],
                             semi_major_axis2, semi_minor_axis2, angle2)
     xr, yr = ring_sector_xy(float(np.asarray(c)[0]), float(np.asarray(c)[1]),
-                              r_in, r_out)
+                              r_in, r_out,
+                              open_start=-np.pi, open_end=-np.pi/2)
     _te = np.linspace(0, 2 * np.pi, 200)
 
     ax.plot(x1sq, y1sq, label="Square 1")
@@ -405,12 +442,10 @@ def main():
     ax.plot(model_y[-1, 0], model_y[-1, 1], marker="o", markersize=36, c="darkblue")
 
     _cx, _cy = float(np.asarray(c)[0]), float(np.asarray(c)[1])
-    _th = np.linspace(0, 2 * np.pi, 180)
-    _xo = _cx + r_out * np.cos(_th); _yo = _cy + r_out * np.sin(_th)
-    _xi = _cx + r_in  * np.cos(_th[::-1]); _yi = _cy + r_in  * np.sin(_th[::-1])
+    _xr, _yr = ring_sector_xy(_cx, _cy, r_in, r_out,
+                               open_start=-np.pi, open_end=-np.pi/2)
 
-    ax.fill(np.concatenate([_xo, _xi]), np.concatenate([_yo, _yi]),
-            color="lightblue", alpha=1.0)
+    ax.fill(_xr, _yr, color="lightblue", alpha=1.0)
     ax.fill(xe + ae * np.cos(_te), ye + be * np.sin(_te),
             color="lightblue", alpha=1.0)
     ax.fill(x1sq, y1sq, color="lightblue", alpha=1.0)
@@ -447,8 +482,7 @@ def main():
     ax.plot(model_y[0, 0],  model_y[0, 1],  marker="o", markersize=36, c="saddlebrown")
     ax.plot(model_y[-1, 0], model_y[-1, 1], marker="o", markersize=36, c="darkblue")
 
-    ax.fill(np.concatenate([_xo, _xi]), np.concatenate([_yo, _yi]),
-            color="lightblue", alpha=1.0)
+    ax.fill(_xr, _yr, color="lightblue", alpha=1.0)
     ax.fill(xe + ae * np.cos(_te), ye + be * np.sin(_te),
             color="lightblue", alpha=1.0)
     ax.fill(x1sq, y1sq, color="lightblue", alpha=1.0)
