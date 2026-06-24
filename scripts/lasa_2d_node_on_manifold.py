@@ -181,14 +181,17 @@ def main():
     semi_minor_axis1 = 7
     angle1           = -np.pi / 4
 
-    center2          = (-25 + 3 * np.sqrt(2), -14 + 3 * np.sqrt(2))
-    semi_major_axis2 = 6
-    semi_minor_axis2 = 3
-    angle2           = np.pi / 4 + np.pi / 2
-
-    c      = jnp.array([-4.0, -14.0], dtype=jnp.float32)
-    r_in   = 3.5
-    r_out  = 5.5
+    # C-shape obstacle via smooth implicit function:
+    #   h_c(x,y) = smax_β(r - r_max, r_min - r, θ₀ - |θ|)
+    #   Γ(x) = h_c(x) + 1   (= 1 on boundary, > 1 outside, < 1 inside)
+    # smax_β is log-sum-exp smooth max: (1/β) log Σ exp(β·zᵢ)
+    # Each term > 0 ↔ in free space (outside outer wall / inside hole / in opening).
+    cx_c      = -4.0
+    cy_c      = -14.0
+    r_min_c   = 3.5
+    r_max_c   = 5.5
+    theta_0_c = float(0.45 * np.pi)   # opening half-angle (opening faces right)
+    beta_c    = 10.0                   # smooth-max sharpness
 
     ae, be = 8.0, 1.5
     xe     = 1.5                                          # shifted 5 units left
@@ -196,10 +199,8 @@ def main():
 
     # ── Gamma functions (Γ ≥ 1 outside obstacle, = 1 on boundary) ────────────
 
-    _c1 = jnp.array([center1[0], center1[1]], dtype=jnp.float32)
-    _c2 = jnp.array([center2[0], center2[1]], dtype=jnp.float32)
-    _cc = c
-    _eps = 1e-9
+    _c1   = jnp.array([center1[0], center1[1]], dtype=jnp.float32)
+    _eps  = 1e-9
 
     def _gamma_sq(x, center, a, b, angle):
         ta = (x[0] - center[0]) * jnp.cos(angle) - (x[1] - center[1]) * jnp.sin(angle)
@@ -210,72 +211,54 @@ def main():
     def _gamma_ellipse(x):
         return ((x[0] - xe) / ae) ** 2 + ((x[1] - ye) / be) ** 2
 
-    # 3/4-ring opening: lower-left, ±45° from the -135° direction.
-    _ring_open_dir = jnp.array([-1.0 / np.sqrt(2), -1.0 / np.sqrt(2)])
-    _ring_open_cos = float(np.cos(np.pi / 4))   # ≈ 0.707, same ±45° half-width
+    def _gamma_cshape(x):
+        dx    = x[0] - cx_c
+        dy    = x[1] - cy_c
+        r     = jnp.sqrt(dx * dx + dy * dy + _eps)
+        theta = jnp.arctan2(-dy, -dx)  # 180° rotation around center
+        t1 = r - r_max_c                    # > 0: outside outer wall
+        t2 = r_min_c - r                    # > 0: inside inner hole
+        t3 = jnp.abs(theta) - (jnp.pi - theta_0_c)  # > 0: in opening sector (left side)
+        # smooth max via log-sum-exp (numerically stable, C¹ everywhere)
+        h_c = jax.nn.logsumexp(jnp.array([beta_c * t1, beta_c * t2, beta_c * t3])) / beta_c
+        return h_c + 1.0
 
-    def _gamma_ring_3quarter(x):
-        diff = x - _cc
-        r = jnp.sqrt(diff @ diff + _eps)
-        gamma_outer = r / r_out
-        diff_norm = diff / (r + _eps)
-        cos_a = diff_norm @ _ring_open_dir
-        # Hard cutoff: open sector (cos_a > threshold) → Gamma=100 (no obstacle);
-        # closed sector → r/r_out as usual.
-        # jnp.where gradient is 0 in the open branch, but w_mod=0 there anyway
-        # (Gamma=100 >> 1+mod_margin), so M_eff=I and the zero gradient is harmless.
-        return jnp.where(cos_a > _ring_open_cos, jnp.array(100.0), gamma_outer)
-
+    # min-Γ over all obstacles — only used for safety check and logging
     def gamma_combined(x):
-        # Use min over individual Γᵢ as the combined representation.
-        # softmin(ρ) ≤ true min always, and can drop below 1 even when all Γᵢ > 1
-        # (phantom obstacle between adjacent sq1/sq2), making λ₁ negative.
-        # jnp.min gives Γ ≥ 1 outside all obstacles. JAX computes subgradient via
-        # straight-through of the argmin element, which is correct geometrically.
         g1 = _gamma_sq(x, _c1, semi_major_axis1, semi_minor_axis1, angle1)
-        g2 = _gamma_sq(x, _c2, semi_major_axis2, semi_minor_axis2, angle2)
-        g3 = _gamma_ring_3quarter(x)
+        g3 = _gamma_cshape(x)
         g4 = _gamma_ellipse(x)
-        return jnp.min(jnp.stack([g1, g2, g3, g4]))
+        return jnp.min(jnp.stack([g1, g3, g4]))
 
-    _gamma_vg = jax.jit(jax.value_and_grad(gamma_combined))
     _gamma_jit = jax.jit(gamma_combined)
 
-    # Individual Gamma JIT functions for per-obstacle blend weights
-    _gamma_sq1_jit  = jax.jit(lambda x: _gamma_sq(x, _c1, semi_major_axis1, semi_minor_axis1, angle1))
-    _gamma_sq2_jit  = jax.jit(lambda x: _gamma_sq(x, _c2, semi_major_axis2, semi_minor_axis2, angle2))
-    _gamma_ring_jit = jax.jit(_gamma_ring_3quarter)
-    _gamma_ell_jit  = jax.jit(_gamma_ellipse)
+    # Per-obstacle value-and-grad JITs (for computing individual M_i)
+    _vg_sq1    = jax.jit(jax.value_and_grad(
+        lambda x: _gamma_sq(x, _c1, semi_major_axis1, semi_minor_axis1, angle1)))
+    _vg_cshape = jax.jit(jax.value_and_grad(_gamma_cshape))
+    _vg_ell    = jax.jit(jax.value_and_grad(_gamma_ellipse))
 
-    # ── On-manifold modulation matrix M(x) ───────────────────────────────────
-    # Diagonal modulation (no φ term). The φ term creates balance-condition
-    # fixed points φ*(n̂·v) + λ₂*(e₁·v) = 0 for any fixed δ at some boundary
-    # point, even for a goal-directed DS. Instead, we choose the blend target
-    # v_input so that e₁·v_input < 0 throughout the relevant boundary arc —
-    # then φ is never activated and no balance point can form.
+    # Per-obstacle scalar Γ JITs (for sorting)
+    _g_sq1    = jax.jit(lambda x: _gamma_sq(x, _c1, semi_major_axis1, semi_minor_axis1, angle1))
+    _g_cshape = jax.jit(_gamma_cshape)
+    _g_ell    = jax.jit(_gamma_ellipse)
 
-    def compute_modulation_matrix(x):
-        """Returns M(x) using diagonal modulation (no φ term)."""
-        Gamma, grad_Gamma = _gamma_vg(x)
-        # Clamp Gamma ≥ 1 so λ₁ = 1-1/Γ stays ≥ 0.  Discrete Euler steps can
-        # overshoot the boundary (Γ drops below 1); without the clamp λ₁ < 0
-        # reverses the normal component and pushes the robot deeper inside.
-        norm_g = jnp.sqrt(grad_Gamma @ grad_Gamma + 1e-12)
-        n_hat  = grad_Gamma / norm_g
+    _ALL_VGS = [_vg_sq1, _vg_cshape, _vg_ell]
+    _ALL_GS  = [_g_sq1,  _g_cshape,  _g_ell]
+
+    # ── Per-obstacle modulation matrix M_i(x) ────────────────────────────────
+    def compute_M_i(vg_fn, x):
+        """Diagonal modulation matrix for a single obstacle's Γ_i.
+        Effective boundary at Γ=mod_gamma: λ₁=0 there, λ₁<0 inside."""
+        Gamma_i, grad_i = vg_fn(x)
+        norm_g = jnp.sqrt(grad_i @ grad_i + 1e-12)
+        n_hat  = grad_i / norm_g
         e1     = jnp.array([-n_hat[1], n_hat[0]])
-
-        lam1 = 1.0 - 1.0 / Gamma
-        lam2 = 1.0 + 1.0 / Gamma
-
-        H   = jnp.column_stack([n_hat, e1])
-        Lam = jnp.diag(jnp.array([lam1, lam2]))
-        return H @ Lam @ H.T, Gamma
-
-    def apply_modulation(x, v_in):
-        M, Gamma = compute_modulation_matrix(x)
-        return M @ v_in, Gamma
-
-    _apply_mod = jax.jit(apply_modulation)
+        lam1   = 1.0 - 1.1 / Gamma_i
+        lam2   = 1.0 + 1.1 / Gamma_i
+        H      = jnp.column_stack([n_hat, e1])
+        Lam    = jnp.diag(jnp.array([lam1, lam2]))
+        return H @ Lam @ H.T, Gamma_i
 
     # ── Reference rollout & simulation setup ─────────────────────────────────
     ys    = posn
@@ -286,29 +269,12 @@ def main():
     dti   = ts[1] - ts[0]
 
     alpha_L    = 4.0
-    clf_margin = 0.3    # CLF suppressed when Gamma < 1+clf_margin
-    k_goal     = 2.0   # goal-directed DS gain
-    k_rot      = 6.0   # CW  rotation gain around ellipse center
-    k_ring     = 4.0   # CCW rotation gain around ring center (guides robot over the top)
-    max_steps  = 5000
+    clf_margin = 0.3
+    mod_gamma  = 3.0    # modulation active when Gamma < mod_gamma
+    max_steps  = 2000
     reach_tol  = 0.5
 
-    # Per-obstacle goal-blend margins:
-    # sq1/sq2 get a tight margin so the nominal NODE DS dominates most of the time.
-    sq_blend_margin   = 0.1
-    ring_blend_margin = 0.5   # larger margin: CCW blend activates before robot gets too close
-    ell_blend_margin  = 0.1
-
-    # Soft modulation activation margin: M(x) blends linearly to I when
-    # Γ > 1 + mod_margin, so the nominal DS is unaffected far from obstacles.
-    mod_margin = 1.5
-
-    # Goal: reference trajectory endpoint; ellipse center for CW rotation
-    xgoal  = xref[-1]
-    xe_val = float(xe)
-    ye_val = float(ye)
-
-    print("\nRunning CLF + On-Manifold Modulation loop (min-Γ, per-obstacle blend)...")
+    print("\nRunning CLF + On-Manifold Modulation loop...")
     for i in range(max_steps):
         idx    = min(i, len(ts) - 1)
         x_t    = jnp.array(x, dtype=jnp.float32)
@@ -330,50 +296,19 @@ def main():
         u_clf  = clf_scale * u_clf_raw
         v_clf  = v_nom + u_clf
 
-        # ── Step 2: Per-obstacle blend ─────────────────────────────────────────
-        # sq1/sq2/ring: blend to goal-directed DS.
-        # ellipse: add CW rotation around the ellipse center to the goal DS.
-        #   v_cw = [(y-ye), -(x-xe)] always has e₁·v < 0 on the lower-left arc,
-        #   so the diagonal modulation deflects the robot LEFT without any φ
-        #   balance-condition fixed point.
-        g1 = float(_gamma_sq1_jit(x_t))
-        g2 = float(_gamma_sq2_jit(x_t))
-        g3 = float(_gamma_ring_jit(x_t))
-        g4 = float(_gamma_ell_jit(x_t))
-        w1 = max(0.0, min(1.0, (1.0 + sq_blend_margin   - g1) / sq_blend_margin))
-        w2 = max(0.0, min(1.0, (1.0 + sq_blend_margin   - g2) / sq_blend_margin))
-        w3 = max(0.0, min(1.0, (1.0 + ring_blend_margin - g3) / ring_blend_margin))
-        w4 = max(0.0, min(1.0, (1.0 + ell_blend_margin  - g4) / ell_blend_margin))
-        w_goal  = max(w1, w2, w3, w4)
-        w_total = w1 + w2 + w3 + w4 + 1e-9
-
-        v_goal_d = k_goal * (xgoal - x_t)
-
-        # Ring: goal-directed toward an escape point outside the opening.
-        # CCW rotation fails at the ring center (zero field); a fixed attraction
-        # point past the opening works for any robot position inside/near the ring.
-        cx_ring = float(np.asarray(c)[0])   # -4.0
-        cy_ring = float(np.asarray(c)[1])   # -14.0
-        escape_pt = jnp.array([cx_ring + (r_out + 3.0) * float(_ring_open_dir[0]),
-                                cy_ring + (r_out + 3.0) * float(_ring_open_dir[1])])
-        v_ccw_ring = k_ring * (escape_pt - x_t)
-
-        # Ellipse: CW rotation around ellipse center.
-        v_cw_pure = k_rot * jnp.array([(x_t[1] - ye_val), -(x_t[0] - xe_val)])
-        w_cw = max(0.0, min(1.0, (ye_val - float(x_t[1])) / float(be)))
-        v_blend_ell = w_cw * v_cw_pure + (1.0 - w_cw) * v_goal_d
-
-        v_blend_target = ((w1 + w2) * v_goal_d + w3 * v_ccw_ring + w4 * v_blend_ell) / w_total
-        v_input  = (1.0 - w_goal) * v_clf + w_goal * v_blend_target
-
-        # ── Step 3: On-manifold modulation (outer layer, diagonal M, no φ) ────
-        # Soft activation: blend M(x) → I as Γ → 1 + mod_margin.
-        # When Γ > 1 + mod_margin: w_mod = 0 → M_eff = I (no effect).
-        # When Γ = 1 (boundary):   w_mod = 1 → M_eff = M(x) (full modulation).
-        M_mat, Gamma = compute_modulation_matrix(x_t)
-        w_mod = max(0.0, min(1.0, (1.0 + mod_margin - float(Gamma)) / mod_margin))
-        M_eff = w_mod * M_mat + (1.0 - w_mod) * jnp.eye(2)
-        v_final = M_eff @ v_input
+        # ── Cascade modulation: M_1 @ M_2 @ M_3 @ M_4 @ v_clf ───────────────
+        # Sort obstacles nearest-first (smallest Γ_i first), apply each M_i
+        # only when Γ_i < mod_gamma so far-away obstacles don't interfere.
+        obs_pairs = sorted(
+            zip([float(g(x_t)) for g in _ALL_GS], _ALL_VGS),
+            key=lambda p: p[0]
+        )
+        Gamma = obs_pairs[0][0]  # min Γ for logging
+        v_final = v_clf
+        for g_i, vg_fn in obs_pairs:
+            if g_i < mod_gamma:
+                M_i, _ = compute_M_i(vg_fn, x_t)
+                v_final = M_i @ v_final
 
         # ── Euler step ────────────────────────────────────────────────────────
         xnext = x_t + v_final * dti
@@ -395,16 +330,24 @@ def main():
 
     x1sq, y1sq = square_xy(center1[0], center1[1],
                             semi_major_axis1, semi_minor_axis1, angle1)
-    x2sq, y2sq = square_xy(center2[0], center2[1],
-                            semi_major_axis2, semi_minor_axis2, angle2)
-    xr, yr = ring_sector_xy(float(np.asarray(c)[0]), float(np.asarray(c)[1]),
-                              r_in, r_out,
-                              open_start=-np.pi, open_end=-np.pi/2)
     _te = np.linspace(0, 2 * np.pi, 200)
 
+    # True h_c = 0 level set for the C-shape (smooth, no straight end-caps).
+    _mg   = 1.0
+    _xca  = np.linspace(cx_c - r_max_c - _mg, cx_c + r_max_c + _mg, 400)
+    _yca  = np.linspace(cy_c - r_max_c - _mg, cy_c + r_max_c + _mg, 400)
+    _XC, _YC = np.meshgrid(_xca, _yca)
+    _rc   = np.sqrt((_XC - cx_c)**2 + (_YC - cy_c)**2 + 1e-9)
+    _thc  = np.arctan2(cy_c - _YC, cx_c - _XC)  # 180° rotation around center
+    _stk  = np.array([beta_c * (_rc - r_max_c),
+                      beta_c * (r_min_c - _rc),
+                      beta_c * (np.abs(_thc) - (np.pi - theta_0_c))])
+    _mv   = np.max(_stk, axis=0)
+    _HC   = np.log(np.sum(np.exp(_stk - _mv), axis=0)) / beta_c + _mv / beta_c
+
     ax.plot(x1sq, y1sq, label="Square 1")
-    ax.plot(x2sq, y2sq, label="Square 2")
-    ax.plot(xr, yr,     label="Ring")
+    ax.contour(_XC, _YC, _HC, levels=[0], colors=['tab:green'])
+    ax.contourf(_XC, _YC, _HC, levels=[-1e6, 0], colors=['tab:green'], alpha=0.15)
     ax.plot(xe + ae * np.cos(_te), ye + be * np.sin(_te), label="Ellipse")
     ax.set_xlabel("X-axis", fontsize=14, labelpad=6)
     ax.set_ylabel("Y-axis", fontsize=14, labelpad=6)
@@ -415,54 +358,109 @@ def main():
     plt.close()
     print(f"Saved: {FIGS_DIR / 'path_vs_target_manifold.png'}")
 
-    # ── Fig 2: vector field + motion plan ─────────────────────────────────────
+    # ── Fig 2: nominal vs modulated vector field comparison ───────────────────
     xmin, xmax = -52, 10
     ymin, ymax = -30, 8
     indx = train_indx
 
     f_field = lambda z: model.func(jnp.array(0.0), jnp.array(z, dtype=jnp.float32), None)
 
-    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(19, 14))
-    xg, yg = np.meshgrid(np.linspace(xmin, xmax, 50),
-                          np.linspace(ymin, ymax, 50))
+    xg, yg = np.meshgrid(np.linspace(xmin, xmax, 55),
+                          np.linspace(ymin, ymax, 55))
     xy_vec = np.hstack((xg.reshape(-1, 1), yg.reshape(-1, 1)))
-    uv_vec = np.array(jax.vmap(f_field)(jnp.array(xy_vec, dtype=jnp.float32)))
-    u = uv_vec[:, 0].reshape(xg.shape)
-    v = uv_vec[:, 1].reshape(yg.shape)
-    ax.streamplot(xg, yg, u, v, arrowsize=3, density=1.4, color="plum")
+    xy_jax = jnp.array(xy_vec, dtype=jnp.float32)
+    uv_nom = np.array(jax.vmap(f_field)(xy_jax))
+    u_nom  = uv_nom[:, 0].reshape(xg.shape)
+    v_nom_grid = uv_nom[:, 1].reshape(yg.shape)
+
+    def _modulated_field(z):
+        # Cascade all M_i in fixed order (sq1→sq2→cshape→ell);
+        # vmap cannot sort dynamically, fixed order is still correct per-obstacle.
+        v = model.func(jnp.array(0.0), z, None)
+        for vg_fn in _ALL_VGS:
+            M_i, g_i = compute_M_i(vg_fn, z)
+            v = jnp.where(g_i < mod_gamma, M_i @ v, v)
+        return v
+
+    uv_mod = np.array(jax.vmap(_modulated_field)(xy_jax))
+    u_mod  = uv_mod[:, 0].reshape(xg.shape)
+    v_mod  = uv_mod[:, 1].reshape(yg.shape)
 
     model_y = model(ts, ys[indx, 0])
+
+    # Seed streamlines only from outside all obstacles (Γ ≥ 1).
+    # Modulation guarantees the boundary is impenetrable, so exterior seeds
+    # stay exterior — no interior streamlines arise naturally.
+    gamma_flat = np.array(jax.vmap(_gamma_jit)(xy_jax))
+    exterior   = gamma_flat >= 1.0
+    _seed_xy   = xy_vec[exterior][::4]  # subsample for reasonable density
+
+    def _fill_obstacles(ax_):
+        ax_.contourf(_XC, _YC, _HC, levels=[-1e6, 0], colors=['lightblue'], alpha=1.0)
+        ax_.contour(_XC, _YC, _HC, levels=[0], colors=['steelblue'], linewidths=1.5)
+        ax_.fill(xe + ae * np.cos(_te), ye + be * np.sin(_te), color="lightblue", alpha=1.0)
+        ax_.fill(x1sq, y1sq, color="lightblue", alpha=1.0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(30, 14))
+
+    ax0 = axes[0]
+    ax0.streamplot(xg, yg, u_nom, v_nom_grid, arrowsize=3, color="plum",
+                   start_points=_seed_xy, integration_direction="both", maxlength=100)
+    _fill_obstacles(ax0)
+    ax0.plot(posn[indx, :, 0], posn[indx, :, 1],
+             c="black", linestyle="--", linewidth=6, label="Demonstration")
+    ax0.plot(model_y[:, 0], model_y[:, 1], c="green", linewidth=8, label="Target trajectory")
+    ax0.plot(model_y[0, 0],  model_y[0, 1],  marker="o", markersize=24, c="saddlebrown")
+    ax0.plot(model_y[-1, 0], model_y[-1, 1], marker="o", markersize=24, c="darkblue")
+    ax0.set_title("Nominal NODE vector field $f(x)$", fontsize=16)
+    ax0.set_xlabel(r"$x_1$"); ax0.set_ylabel(r"$x_2$")
+    ax0.set_xlim([xmin, xmax]); ax0.set_ylim([ymin, ymax])
+    ax0.legend(fontsize=12)
+
+    ax1 = axes[1]
+    ax1.streamplot(xg, yg, u_mod, v_mod, arrowsize=3, color="plum",
+                   start_points=_seed_xy, integration_direction="forward", maxlength=100)
+    _fill_obstacles(ax1)
+    ax1.plot(posn[indx, :, 0], posn[indx, :, 1],
+             c="black", linestyle="--", linewidth=6, label="Demonstration")
+    ax1.plot(model_y[:, 0], model_y[:, 1], c="green", linewidth=8, label="Target trajectory")
+    ax1.plot(xall[:, 0], xall[:, 1], c="red", linewidth=8, label="Motion plan (CLF+M)")
+    ax1.plot(model_y[0, 0],  model_y[0, 1],  marker="o", markersize=24, c="saddlebrown")
+    ax1.plot(model_y[-1, 0], model_y[-1, 1], marker="o", markersize=24, c="darkblue")
+    ax1.set_title(r"Modulated vector field $M(x)f(x)$", fontsize=16)
+    ax1.set_xlabel(r"$x_1$"); ax1.set_ylabel(r"$x_2$")
+    ax1.set_xlim([xmin, xmax]); ax1.set_ylim([ymin, ymax])
+    ax1.legend(fontsize=12)
+
+    fig.tight_layout()
+    plt.savefig(FIGS_DIR / "vector_field_comparison_manifold.png", dpi=120, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {FIGS_DIR / 'vector_field_comparison_manifold.png'}")
+
+    # ── Fig 3: nominal vector field + motion plan ─────────────────────────────
+    fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(19, 14))
+    ax.streamplot(xg, yg, u_nom, v_nom_grid, arrowsize=3, color="plum",
+                  start_points=_seed_xy, integration_direction="both", maxlength=100)
+    _fill_obstacles(ax)
     ax.plot(posn[indx, :, 0], posn[indx, :, 1],
             c="black", linestyle="--", linewidth=8, label="Demonstration")
     ax.plot(model_y[:, 0], model_y[:, 1],
             c="green", linewidth=12, label="Target trajectory")
     ax.plot(xall[:, 0], xall[:, 1],
-            c="red", linewidth=8, label="Motion plan")
+            c="red", linewidth=8, label="Motion plan (CLF+M)")
     ax.plot(model_y[0, 0],  model_y[0, 1],  marker="o", markersize=36, c="saddlebrown")
     ax.plot(model_y[-1, 0], model_y[-1, 1], marker="o", markersize=36, c="darkblue")
-
-    _cx, _cy = float(np.asarray(c)[0]), float(np.asarray(c)[1])
-    _xr, _yr = ring_sector_xy(_cx, _cy, r_in, r_out,
-                               open_start=-np.pi, open_end=-np.pi/2)
-
-    ax.fill(_xr, _yr, color="lightblue", alpha=1.0)
-    ax.fill(xe + ae * np.cos(_te), ye + be * np.sin(_te),
-            color="lightblue", alpha=1.0)
-    ax.fill(x1sq, y1sq, color="lightblue", alpha=1.0)
-    ax.fill(x2sq, y2sq, color="lightblue", alpha=1.0)
-
-    ax.set_xlabel(r"$x_1$")
-    ax.set_ylabel(r"$x_2$")
-    ax.set_xlim([float(xmin), float(xmax)])
-    ax.set_ylim([float(ymin), float(ymax)])
+    ax.set_xlabel(r"$x_1$"); ax.set_ylabel(r"$x_2$")
+    ax.set_xlim([float(xmin), float(xmax)]); ax.set_ylim([float(ymin), float(ymax)])
     plt.savefig(FIGS_DIR / "vector_field_manifold.png", dpi=120, bbox_inches="tight")
     plt.close()
     print(f"Saved: {FIGS_DIR / 'vector_field_manifold.png'}")
 
-    # ── Fig 3: vector field colored by rollout step ───────────────────────────
+    # ── Fig 4: vector field colored by rollout step ───────────────────────────
     fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(19, 14))
-    ax.streamplot(xg, yg, u, v, arrowsize=3, density=1.4, color="plum")
-
+    ax.streamplot(xg, yg, u_nom, v_nom_grid, arrowsize=3, color="plum",
+                  start_points=_seed_xy, integration_direction="both", maxlength=100)
+    _fill_obstacles(ax)
     ax.plot(posn[indx, :, 0], posn[indx, :, 1],
             c="black", linestyle="--", linewidth=8, label="Demonstration")
     ax.plot(model_y[:, 0], model_y[:, 1],
@@ -472,8 +470,7 @@ def main():
     _steps = np.arange(len(_path))
     _pts   = _path.reshape(-1, 1, 2)
     _segs  = np.concatenate([_pts[:-1], _pts[1:]], axis=1)
-    _lc    = LineCollection(_segs, cmap="plasma_r", linewidth=8,
-                             label="Motion plan", zorder=3)
+    _lc    = LineCollection(_segs, cmap="plasma_r", linewidth=8, label="Motion plan")
     _lc.set_array(_steps[:-1])
     ax.add_collection(_lc)
     cbar = fig.colorbar(_lc, ax=ax)
@@ -481,17 +478,8 @@ def main():
 
     ax.plot(model_y[0, 0],  model_y[0, 1],  marker="o", markersize=36, c="saddlebrown")
     ax.plot(model_y[-1, 0], model_y[-1, 1], marker="o", markersize=36, c="darkblue")
-
-    ax.fill(_xr, _yr, color="lightblue", alpha=1.0)
-    ax.fill(xe + ae * np.cos(_te), ye + be * np.sin(_te),
-            color="lightblue", alpha=1.0)
-    ax.fill(x1sq, y1sq, color="lightblue", alpha=1.0)
-    ax.fill(x2sq, y2sq, color="lightblue", alpha=1.0)
-
-    ax.set_xlabel(r"$x_1$")
-    ax.set_ylabel(r"$x_2$")
-    ax.set_xlim([float(xmin), float(xmax)])
-    ax.set_ylim([float(ymin), float(ymax)])
+    ax.set_xlabel(r"$x_1$"); ax.set_ylabel(r"$x_2$")
+    ax.set_xlim([float(xmin), float(xmax)]); ax.set_ylim([float(ymin), float(ymax)])
     plt.savefig(FIGS_DIR / "vector_field_manifold_colored.png", dpi=120, bbox_inches="tight")
     plt.close()
     print(f"Saved: {FIGS_DIR / 'vector_field_manifold_colored.png'}")
